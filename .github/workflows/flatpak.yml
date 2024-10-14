@@ -1,0 +1,89 @@
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.yml'
+  pull_request:
+    paths:
+      - '**/*.yml'
+
+name: CI
+
+env:
+    PAGES_REPO_URL: ${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+    FLATPAK_HISTORY_LEN: 0
+    FLATPAK_DELTAS: true
+     
+    FLATPAK_BUILD: build-dir
+    PAGES_REPO: repo-dir
+
+jobs:
+  flatpak:
+    name: "Flatpak"
+    runs-on: ubuntu-latest
+    steps:
+    - name: Maximize build space
+      uses: easimon/maximize-build-space@master
+      with:
+        root-reserve-mb: 10240
+        swap-size-mb: 1024
+        remove-dotnet: 'true'
+
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+
+    - name: Import GPG-key
+      id: gpg-key
+      uses: crazy-max/ghaction-import-gpg@v5
+      with:
+        gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+        passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+    - name: Prepare GPG-pubkey
+      run: |
+          set -e
+          gpg --export ${{ steps.gpg-key.outputs.fingerprint }} > pubkey.gpg
+
+    - name: Install flatpak
+      run: |
+        set -e
+        sudo apt update -y
+        sudo apt install -y flatpak flatpak-builder
+        flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+    
+    - name: Build Flatpak with flatpak-builder
+      run: |
+        set -e
+        mkdir -p ./${{ env.PAGES_REPO }}/repo
+        find . -type f -name '*.yml' -not -path './.github/*' -print0 | while IFS= read -r -d '' file; do
+          flatpak-builder --install-deps-from=flathub --install-deps-only --user /dev/null "$file"
+          flatpak-builder --force-clean --disable-updates --sandbox --gpg-sign=${{ steps.gpg-key.outputs.fingerprint }} --repo=./${{ env.PAGES_REPO }}/repo ${{ env.FLATPAK_BUILD }} "$file"
+        done
+    
+    - name: Create Flatpak repository metadata
+      run: |
+        set -e
+        mkdir -p ./${{ env.PAGES_REPO }}/repo/refs/remotes ./${{ env.PAGES_REPO }}/repo/refs/mirrors
+        touch ./${{ env.PAGES_REPO }}/repo/refs/remotes/.gitkeep ./${{ env.PAGES_REPO }}/repo/refs/mirrors/.gitkeep
+        flatpak build-update-repo --no-update-summary --prune --prune-depth=${{ env.FLATPAK_HISTORY_LEN }} ./${{ env.PAGES_REPO }}/repo
+        flatpak build-update-repo --gpg-sign=${{ steps.gpg-key.outputs.fingerprint }} --gpg-import=pubkey.gpg --generate-static-deltas ./${{ env.PAGES_REPO }}/repo
+
+    - name: Write .flatpakrepo file
+      run: |
+          set -e
+          cat > ${{ env.PAGES_REPO }}/${{ github.repository_owner }}.flatpakrepo << EOF 
+          [Flatpak Repo]
+          Title=${{ env.PAGES_REPO_URL }}
+          Url=https://${{ env.PAGES_REPO_URL }}repo/
+          GPGKey=$(cat pubkey.gpg | base64 --wrap=0)"
+          EOF
+
+    - name: Deploy Repo
+      uses: peaceiris/actions-gh-pages@v3
+      with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ${{ env.PAGES_REPO }}
+          enable_jekyll: true
+          force_orphan: true
+
